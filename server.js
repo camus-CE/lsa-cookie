@@ -83,11 +83,17 @@ function parseCookieHeader(str) {
     .filter(Boolean);
 }
 
-async function getCookiesAndHeader(targetUrl) {
-  if (cache.header && Date.now() < cache.expires) {
+// change signature to accept { force }
+async function getCookiesAndHeader(targetUrl, { force = false } = {}) {
+  if (!force && cache.header && Date.now() < cache.expires) {
     return { header: cache.header, cookies: cache.cookies || [] };
   }
-  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, { headless: true, args: ['--no-sandbox','--disable-dev-shm-usage',`--profile-directory=${PROFILE_NAME}`] });
+  if (force) cache = { header: '', cookies: [], expires: 0 }; // bust in-memory cache
+
+  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', `--profile-directory=${PROFILE_NAME}`],
+  });
 
   const seeded = await readSeed();
   if (seeded) {
@@ -108,6 +114,20 @@ async function getCookiesAndHeader(targetUrl) {
   return { header, cookies };
 }
 
+app.get('/cookie', requireKey, async (req, res) => {
+  try {
+    const url = req.query.url || TARGET_URL;
+    const origin = req.query.origin || new URL(url).origin;
+    const force = ['1','true','yes'].includes(String(req.query.force).toLowerCase());
+
+    const { header, cookies } = await getCookiesAndHeader(url, { force });
+    const authHeader = buildSAPISIDHASH(cookies, origin);
+
+    res.json({ cookieHeader: header, authHeader, origin, forced: force });
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
 
 app.get('/cookie', requireKey, async (req, res) => {
   try {
@@ -147,4 +167,5 @@ app.delete('/seed', requireKey, async (_req, res) => {
 app.get('/healthz', (_req, res) => res.send('ok'));
 
 app.listen(PORT, () => console.log(`lsa-cookie on :${PORT}`));
+
 
