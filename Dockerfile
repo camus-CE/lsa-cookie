@@ -1,16 +1,26 @@
-FROM ghcr.io/linuxserver/chromium:latest
+# Includes Node + Chromium + all required system libraries
+FROM mcr.microsoft.com/playwright:v1.55.1-jammy
 
+# (Optional) run as root so /config volume perms are never an issue
 USER root
-RUN apt-get update \
- && apt-get install -y curl ca-certificates gnupg \
- && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
- && apt-get install -y nodejs \
- && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Make sure /config exists and is writable even before the volume is attached
+RUN mkdir -p /config && chmod -R 777 /config
 
 WORKDIR /app
+
 COPY package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+RUN npm ci --omit=dev
 
 COPY server.js ./
+
+ENV NODE_ENV=production
+# Set sensible defaults (can still be overridden in Sliplane env)
+ENV PROFILE_DIR=/config/.config/chromium
+ENV PROFILE_NAME=Default
+ENV TARGET_URL=https://ads.google.com/localservices/accountpicker
+ENV WAIT_UNTIL=networkidle
+ENV COOKIE_TTL_MS=3600000
+
 EXPOSE 8080
-CMD ["node","server.js"]
+CMD ["node", "server.js"]
