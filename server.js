@@ -43,7 +43,10 @@ async function writeSeed(v) {
 }
 
 function parseCookieHeader(str) {
-  // Convert "a=b; c=d; SID=..." into Playwright cookie objects for .google.com
+  // Convert "a=b; c=d; SID=..." into Playwright cookie objects
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + 7 * 24 * 3600;
+
   return (str || '')
     .split(/;\s*/)
     .map(kv => {
@@ -52,17 +55,30 @@ function parseCookieHeader(str) {
       const name = kv.slice(0, i).trim();
       const value = kv.slice(i + 1).trim();
       if (!name) return null;
-      return {
+
+      // Base cookie fields
+      const base = {
         name,
         value,
-        domain: '.google.com',
         path: '/',
         secure: true,
         httpOnly: true,
         sameSite: 'Lax',
-        // Give seeded cookies a week horizon; Google may override them anyway.
-        expires: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
+        expires: exp,
       };
+
+      // 1) __Host-* must be host-only (no Domain) → use url
+      if (name.startsWith('__Host-')) {
+        return { ...base, url: 'https://ads.google.com' };
+      }
+
+      // 2) OSID cookies live on accounts.google.com
+      if (name === 'OSID' || name === '__Secure-OSID') {
+        return { ...base, domain: 'accounts.google.com' };
+      }
+
+      // 3) Everything else: .google.com (covers SID/HSID/SSID/APISID/SAPISID/NID/etc.)
+      return { ...base, domain: '.google.com' };
     })
     .filter(Boolean);
 }
@@ -131,3 +147,4 @@ app.delete('/seed', requireKey, async (_req, res) => {
 app.get('/healthz', (_req, res) => res.send('ok'));
 
 app.listen(PORT, () => console.log(`lsa-cookie on :${PORT}`));
+
