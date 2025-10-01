@@ -1,7 +1,5 @@
-# Use the same Chromium family as your GUI container
 FROM ghcr.io/linuxserver/chromium:latest
 
-# Install Node 20 LTS
 USER root
 RUN apt-get update \
  && apt-get install -y curl ca-certificates gnupg \
@@ -13,8 +11,6 @@ WORKDIR /app
 COPY package*.json ./
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
-# server
 COPY server.js ./
-
 EXPOSE 8080
-CMD ["node", "server.js"]
+CMD ["node","server.js"]
