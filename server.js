@@ -36,9 +36,8 @@ function requireKey(req, res, next) {
 }
 
 function profileHasDb() {
-  try {
-    return fs.existsSync(path.join(PROFILE_DIR, PROFILE_NAME, 'Cookies'));
-  } catch { return false; }
+  try { return fs.existsSync(path.join(PROFILE_DIR, PROFILE_NAME, 'Cookies')); }
+  catch { return false; }
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -59,10 +58,10 @@ async function cloneProfileToTemp() {
   const dstRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'lsa-prof-'));
   const dstDefault = path.join(dstRoot, PROFILE_NAME);
 
-  try {
-    await fsp.copyFile(path.join(srcRoot, 'Local State'), path.join(dstRoot, 'Local State'));
-  } catch {}
+  // copy Local State (has os_crypt key)
+  try { await fsp.copyFile(path.join(srcRoot, 'Local State'), path.join(dstRoot, 'Local State')); } catch {}
 
+  // minimal files from Default needed to read cookies
   const mustCopy = [
     'Cookies',
     path.join('Network', 'Cookies'),
@@ -111,6 +110,21 @@ async function getAllCookies(page) {
   return cookies || [];
 }
 
+// ---- auth cookie wait logic ----
+function hasAuthCookies(list) {
+  return list.some(c => c.name === 'SID' || c.name === '__Secure-1PSID' || c.name === '__Secure-3PSID');
+}
+
+async function waitForSID(page, timeoutMs = 12000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const ck = await getAllCookies(page);
+    if (hasAuthCookies(ck)) return ck;
+    await sleep(500);
+  }
+  return await getAllCookies(page); // best effort
+}
+
 // -----------------------------------------------------------
 async function fetchFreshAuth(targetUrl) {
   const { userDataDir, cleanup } = await cloneProfileToTemp();
@@ -118,9 +132,9 @@ async function fetchFreshAuth(targetUrl) {
   const browser = await puppeteer.launch({
     headless: HEADLESS,
     executablePath: CHROME_PATH,
-    userDataDir,
+    userDataDir, // launch against the clone
     args: [
-      `--profile-directory=${PROFILE_NAME}`,
+      `--profile-directory=${PROFILE_NAME}`, // "Default" inside the clone
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--password-store=basic',
@@ -143,8 +157,16 @@ async function fetchFreshAuth(targetUrl) {
     await page.goto(url, { waitUntil: WAIT_UNTIL });
     await sleep(1200);
 
-    // All cookies (accounts + ads + myaccount, etc.)
-    const cookies = await getAllCookies(page);
+    // Wait until GAIA session cookies (SID/PSID) are present
+    let cookies = await waitForSID(page);
+
+    // If still missing, poke GAIA once more and wait again
+    if (!hasAuthCookies(cookies)) {
+      const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/';
+      await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
+      await sleep(800);
+      cookies = await waitForSID(page, 8000);
+    }
 
     const cookieHeader = cookies
       .filter(c => (c.domain || '').includes('google.com'))
@@ -154,10 +176,14 @@ async function fetchFreshAuth(targetUrl) {
     const origin = new URL(targetUrl || LSA_URL).origin;
     const authHeader = buildSAPISIDHASH(cookies, origin);
 
-    return { cookies, cookieHeader, authHeader, origin };
+    const foundAuth = cookies
+      .filter(c => ['SID','__Secure-1PSID','__Secure-3PSID','SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'].includes(c.name))
+      .map(c => c.name);
+
+    return { cookies, cookieHeader, authHeader, origin, foundAuth };
   } finally {
     await browser.close();
-    await cleanup();
+    await cleanup(); // remove temp clone
   }
 }
 
@@ -177,11 +203,11 @@ app.get('/cookie', requireKey, async (req, res) => {
       });
     }
 
-    const { cookies, cookieHeader, authHeader, origin } = await fetchFreshAuth(url);
+    const { cookies, cookieHeader, authHeader, origin, foundAuth } = await fetchFreshAuth(url);
 
     cache = { cookieHeader, cookies, authHeader, expires: Date.now() + COOKIE_TTL_MS };
 
-    res.json({ cookieHeader, authHeader, origin, fromCache: false, at: new Date().toISOString() });
+    res.json({ cookieHeader, authHeader, origin, foundAuth, fromCache: false, at: new Date().toISOString() });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
