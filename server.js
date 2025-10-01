@@ -145,84 +145,129 @@ async function cloneNamedProfileToTemp(profileName) {
 }
 
 /* =========================
+   Single attempt on a given profile
+========================= */
+async function tryProfileOnce(profileName, targetUrl) {
+  const cloned = await cloneNamedProfileToTemp(profileName);
+
+  const browser = await puppeteer.launch({
+    headless: HEADLESS,
+    executablePath: CHROME_PATH,
+    userDataDir: cloned.userDataDir,
+    args: [
+      `--profile-directory=${profileName}`,
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--password-store=basic',
+      '--use-mock-keychain',
+      '--no-first-run',
+      '--no-default-browser-check'
+    ]
+  });
+
+  try {
+    const page = await browser.newPage();
+
+    // GAIA preflight through the LSA flow
+    const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/';
+    await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
+    await sleep(800);
+
+    // build a sequence of "touch" URLs; try caller's URL first
+    const base = (targetUrl || LSA_URL);
+    const touchUrls = [
+      base,
+      'https://ads.google.com/localservicesads/leads',
+      'https://ads.google.com/localservicesads/accountpicker',
+      // your deep lead link (strong minting signal):
+      'https://ads.google.com/localservices/lead?cid=1711176863&bid=2543314145&pid=9999999999&mcid=9121518467&euid=5170738981&lid=4823432947&hl=en&gl=US',
+    ];
+
+    let cookies = [];
+    for (const u of touchUrls) {
+      const urlWithBust = u + (u.includes('?') ? '&' : '?') + `t=${Date.now()}`;
+      await page.goto(urlWithBust, { waitUntil: WAIT_UNTIL });
+      await sleep(1200);
+      cookies = await waitForSID(page, 6000);
+      if (hasAuthCookies(cookies)) break;
+    }
+
+    if (!hasAuthCookies(cookies)) {
+      const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/';
+      await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
+      await sleep(800);
+      const urlWithBust = base + (base.includes('?') ? '&' : '?') + `t=${Date.now()}`;
+      await page.goto(urlWithBust, { waitUntil: WAIT_UNTIL });
+      await sleep(1200);
+      cookies = await waitForSID(page, 8000);
+    }
+
+    const foundAuth = cookies
+      .filter(c => ['SID','__Secure-1PSID','__Secure-3PSID','SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'].includes(c.name))
+      .map(c => c.name);
+
+    const cookieHeader = cookies
+      .filter(c => (c.domain || '').includes('google.com'))
+      .map(c => `${c.name}=${c.value}`)
+      .join('; ');
+
+    const origin = new URL(base).origin;
+    const authHeader = buildSAPISIDHASH(cookies, origin);
+
+    return {
+      ok: Boolean(foundAuth.length || authHeader),
+      cookies, cookieHeader, authHeader, origin, foundAuth,
+      debug: {
+        pickedProfile: profileName,
+        source: cloned.source,
+        sampleCookieNames: cookies.slice(0, 12).map(c => c.name)
+      },
+      _cleanup: cloned.cleanup
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: e.message,
+      debug: { pickedProfile: profileName, source: cloned.source },
+      _cleanup: cloned.cleanup
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
+/* =========================
    Try multiple profiles until auth is found
 ========================= */
-async function fetchFreshAuth(targetUrl) {
-  const candidates = listCandidateProfiles();
-  let lastDebug = {};
+async function fetchFreshAuth(targetUrl, forcedProfile) {
+  const tried = [];
+  const candidates = forcedProfile ? [forcedProfile] : listCandidateProfiles();
 
   for (const candidate of candidates) {
-    const cloned = await cloneNamedProfileToTemp(candidate);
-    lastDebug = { pickedProfile: candidate, source: cloned.source };
+    const attempt = await tryProfileOnce(candidate, targetUrl);
+    tried.push({ profile: candidate, ok: attempt.ok, error: attempt.error, debug: attempt.debug });
+    try { await attempt._cleanup(); } catch {}
 
-    const browser = await puppeteer.launch({
-      headless: HEADLESS,
-      executablePath: CHROME_PATH,
-      userDataDir: cloned.userDataDir,
-      args: [
-        `--profile-directory=${candidate}`,
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--password-store=basic',
-        '--use-mock-keychain',
-        '--no-first-run',
-        '--no-default-browser-check'
-      ]
-    });
-
-    try {
-      const page = await browser.newPage();
-
-      // GAIA preflight (through the LSA flow)
-      const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/';
-      await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
-      await sleep(800);
-
-      // LSA page (mints PSIDTS/SIDTS)
-      const url = (targetUrl || LSA_URL) + ((targetUrl || LSA_URL).includes('?') ? '&' : '?') + `t=${Date.now()}`;
-      await page.goto(url, { waitUntil: WAIT_UNTIL });
-      await sleep(1200);
-
-      // Wait for GAIA session cookies
-      let cookies = await waitForSID(page);
-
-      if (!hasAuthCookies(cookies)) {
-        const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/';
-        await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
-        await sleep(800);
-        cookies = await waitForSID(page, 8000);
-      }
-
-      const foundAuth = cookies
-        .filter(c => ['SID','__Secure-1PSID','__Secure-3PSID','SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'].includes(c.name))
-        .map(c => c.name);
-
-      const cookieHeader = cookies
-        .filter(c => (c.domain || '').includes('google.com'))
-        .map(c => `${c.name}=${c.value}`)
-        .join('; ');
-
-      const origin = new URL(targetUrl || LSA_URL).origin;
-      const authHeader = buildSAPISIDHASH(cookies, origin);
-
-      if (foundAuth.length || authHeader) {
-        return { cookies, cookieHeader, authHeader, origin, foundAuth, debug: lastDebug };
-      }
-      // else try next candidate
-    } finally {
-      await browser.close();
-      await cloned.cleanup();
+    if (attempt.ok) {
+      return {
+        cookies: attempt.cookies,
+        cookieHeader: attempt.cookieHeader,
+        authHeader: attempt.authHeader,
+        origin: attempt.origin,
+        foundAuth: attempt.foundAuth,
+        debug: { pickedProfile: candidate, tried }
+      };
     }
   }
 
-  // none worked — return debug so you can see what it tried
+  // none worked
   return {
     cookies: [],
     cookieHeader: '',
     authHeader: '',
-    origin: new URL(LSA_URL).origin,
+    origin: new URL(targetUrl || LSA_URL).origin,
     foundAuth: [],
-    debug: lastDebug
+    debug: { pickedProfile: candidates[candidates.length - 1], tried }
   };
 }
 
@@ -231,30 +276,41 @@ async function fetchFreshAuth(targetUrl) {
 ========================= */
 app.get('/cookie', requireKey, async (req, res) => {
   try {
-    const force = ['1','true','yes'].includes(String(req.query.force || '').toLowerCase());
-    const url   = req.query.url || LSA_URL;
+    const force   = ['1','true','yes'].includes(String(req.query.force || '').toLowerCase());
+    const url     = req.query.url || LSA_URL;
+    const profile = typeof req.query.profile === 'string' && req.query.profile.trim() ? req.query.profile.trim() : undefined;
+    const verbose = ['1','true','yes'].includes(String(req.query.verbose || '').toLowerCase());
 
-    if (!force && cache.cookieHeader && Date.now() < cache.expires) {
+    if (!force && cache.cookieHeader && Date.now() < cache.expires && !profile) {
       return res.json({
         cookieHeader: cache.cookieHeader,
-        authHeader: cache.authHeader,
-        origin: new URL(url).origin,
-        fromCache: true,
-        at: new Date().toISOString()
+        authHeader:   cache.authHeader,
+        origin:       new URL(url).origin,
+        fromCache:    true,
+        at:           new Date().toISOString()
       });
     }
 
-    const { cookies, cookieHeader, authHeader, origin, foundAuth, debug } = await fetchFreshAuth(url);
+    const { cookies, cookieHeader, authHeader, origin, foundAuth, debug } =
+      await fetchFreshAuth(url, profile);
+
     cache = { cookieHeader, cookies, authHeader, expires: Date.now() + COOKIE_TTL_MS };
 
-    res.json({ cookieHeader, authHeader, origin, foundAuth, debug, fromCache: false, at: new Date().toISOString() });
+    res.json({
+      cookieHeader,
+      authHeader,
+      origin,
+      foundAuth,
+      debug: verbose ? debug : { pickedProfile: debug.pickedProfile },
+      fromCache: false,
+      at: new Date().toISOString()
+    });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
 });
 
 app.get('/whoami', (_req, res) => {
-  // report which profile on disk appears to have cookie DBs
   let resolvedProfile = PROFILE_NAME_PREFERRED;
   let resolvedPath = path.join(PROFILE_DIR, PROFILE_NAME_PREFERRED);
   for (const name of listCandidateProfiles()) {
