@@ -28,6 +28,7 @@ const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '600000', 10); // 10
 
 let cache = { cookieHeader: '', cookies: [], authHeader: '', expires: 0 };
 
+// ===== Helpers =====
 function requireKey(req, res, next) {
   if (!API_KEY) return next();
   if (req.headers['x-api-key'] === API_KEY) return next();
@@ -40,6 +41,8 @@ function profileHasDb() {
   } catch { return false; }
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 function buildSAPISIDHASH(cookies, origin = 'https://ads.google.com') {
   const get = n => cookies.find(c => c.name === n)?.value;
   const sapsid = get('SAPISID') || get('__Secure-3PAPISID') || get('__Secure-1PAPISID');
@@ -49,25 +52,23 @@ function buildSAPISIDHASH(cookies, origin = 'https://ads.google.com') {
   return `SAPISIDHASH ${ts}_${hash}`;
 }
 
-// ---- NEW: clone profile to avoid ProcessSingleton lock ----
+// ---- clone profile to avoid ProcessSingleton lock ----
 async function cloneProfileToTemp() {
   const srcRoot = PROFILE_DIR;
   const srcDefault = path.join(srcRoot, PROFILE_NAME);
-  const dstRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'lsa-prof-')); // e.g., /tmp/lsa-prof-abc123
+  const dstRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'lsa-prof-'));
   const dstDefault = path.join(dstRoot, PROFILE_NAME);
 
-  // copy Local State (has os_crypt key)
   try {
     await fsp.copyFile(path.join(srcRoot, 'Local State'), path.join(dstRoot, 'Local State'));
-  } catch { /* best effort */ }
+  } catch {}
 
-  // minimal files from Default needed to read cookies
   const mustCopy = [
-    'Cookies',                // cookie DB
-    'Network',                // sometimes cookies live under Network/Cookies (new schema)
-    'Preferences',            // not strictly required but cheap
-    'Login Data',             // rarely needed, safe to copy
-    'Secure Preferences'      // contains some profile flags
+    'Cookies',
+    path.join('Network', 'Cookies'),
+    'Preferences',
+    'Login Data',
+    'Secure Preferences'
   ];
 
   await fsp.mkdir(dstDefault, { recursive: true });
@@ -76,13 +77,12 @@ async function cloneProfileToTemp() {
     const dst = path.join(dstDefault, entry);
     try {
       const stat = await fsp.stat(src);
-      if (stat.isDirectory()) {
-        await copyDir(src, dst);
-      } else {
+      if (stat.isDirectory()) await copyDir(src, dst);
+      else {
         await fsp.mkdir(path.dirname(dst), { recursive: true });
         await fsp.copyFile(src, dst);
       }
-    } catch { /* skip missing files */ }
+    } catch {}
   }
 
   return { userDataDir: dstRoot, cleanup: async () => { try { await rmrf(dstRoot); } catch {} } };
@@ -102,22 +102,25 @@ async function copyDir(src, dst) {
   }));
 }
 
-async function rmrf(p) {
-  await fsp.rm(p, { recursive: true, force: true });
+async function rmrf(p) { await fsp.rm(p, { recursive: true, force: true }); }
+
+// Pull ALL cookies via CDP (works across domains & Puppeteer versions)
+async function getAllCookies(page) {
+  const client = await page.target().createCDPSession();
+  const { cookies } = await client.send('Network.getAllCookies');
+  return cookies || [];
 }
 
 // -----------------------------------------------------------
-
 async function fetchFreshAuth(targetUrl) {
-  // 1) Clone the live profile so we don't collide with lsa-login
   const { userDataDir, cleanup } = await cloneProfileToTemp();
 
   const browser = await puppeteer.launch({
     headless: HEADLESS,
     executablePath: CHROME_PATH,
-    userDataDir, // ← launch against the clone
+    userDataDir,
     args: [
-      `--profile-directory=${PROFILE_NAME}`, // "Default" inside the clone
+      `--profile-directory=${PROFILE_NAME}`,
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--password-store=basic',
@@ -133,19 +136,15 @@ async function fetchFreshAuth(targetUrl) {
     // GAIA preflight — load account session cookies
     const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/';
     await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
-    await page.waitForTimeout(800);
+    await sleep(800);
 
-    // Hit LSA so PSIDTS/SIDTS are minted
+    // LSA — mint PSIDTS/SIDTS
     const url = (targetUrl || LSA_URL) + ((targetUrl || LSA_URL).includes('?') ? '&' : '?') + `t=${Date.now()}`;
     await page.goto(url, { waitUntil: WAIT_UNTIL });
-    await page.waitForTimeout(1200);
+    await sleep(1200);
 
-    // Pull cookies from all relevant scopes
-    const cookies = await page.cookies(
-      'https://accounts.google.com',
-      'https://ads.google.com',
-      'https://myaccount.google.com'
-    );
+    // All cookies (accounts + ads + myaccount, etc.)
+    const cookies = await getAllCookies(page);
 
     const cookieHeader = cookies
       .filter(c => (c.domain || '').includes('google.com'))
@@ -158,7 +157,7 @@ async function fetchFreshAuth(targetUrl) {
     return { cookies, cookieHeader, authHeader, origin };
   } finally {
     await browser.close();
-    await cleanup(); // remove temp clone
+    await cleanup();
   }
 }
 
