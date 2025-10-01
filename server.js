@@ -1,36 +1,46 @@
 // server.js
 const express = require('express');
-const puppeteer = require('puppeteer-core');
+const { chromium } = require('playwright'); // <- Playwright
 const crypto = require('crypto');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
-const os = require('os');
 
 const app = express();
-app.use(express.json({ limit: '128kb' }));
+app.use(express.json({ limit: '256kb' }));
 
 /* =========================
    ENV / Defaults
 ========================= */
-const PORT  = parseInt(process.env.PORT || '8080', 10);
+const PORT = parseInt(process.env.PORT || '8080', 10);
+
+// This is the *user data dir root* that both lsa-login and lsa-cookie share
+// e.g. chrome://version shows Profile Path: /config/.config/chromium/Default
 const PROFILE_DIR = process.env.PROFILE_DIR || '/config/.config/chromium';
-const PROFILE_NAME_PREFERRED = process.env.PROFILE_NAME || 'Default';
-const HEADLESS = String(process.env.HEADLESS ?? 'true').toLowerCase() !== 'false';
-const API_KEY  = process.env.API_KEY || '';
-const CHROME_PATH = process.env.CHROMIUM_PATH || '/usr/lib/chromium/chromium';
+const PROFILE_NAME = process.env.PROFILE_NAME || 'Default';
 
-const WAIT_UNTIL = ['load','domcontentloaded','networkidle0','networkidle2']
-  .includes(String(process.env.WAIT_UNTIL || 'domcontentloaded').toLowerCase())
-  ? String(process.env.WAIT_UNTIL || 'domcontentloaded').toLowerCase()
-  : 'domcontentloaded';
+const API_KEY = process.env.API_KEY || '';
+const TARGET_URL =
+  process.env.TARGET_URL ||
+  'https://ads.google.com/localservices/accountpicker';
 
-const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '15000', 10);
+// Playwright accepts 'load' | 'domcontentloaded' | 'networkidle'
+const WAIT_UNTIL_RAW =
+  (process.env.WAIT_UNTIL || 'networkidle').toLowerCase();
+const WAIT_UNTIL =
+  ['load', 'domcontentloaded', 'networkidle'].includes(WAIT_UNTIL_RAW)
+    ? WAIT_UNTIL_RAW
+    : 'networkidle';
 
-const LSA_URL = process.env.TARGET_URL || 'https://ads.google.com/localservicesads/';
-const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '600000', 10);
+const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '20000', 10);
+const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '3600000', 10); // 1h cache
+const HEADLESS =
+  String(process.env.HEADLESS ?? 'true').toLowerCase() !== 'false';
 
-let cache = { cookieHeader: '', cookies: [], authHeader: '', expires: 0 };
+const SEED_FILE = process.env.SEED_FILE || '/config/seed-cookie.txt';
+
+// in-memory cache
+let cache = { header: '', cookies: [], expires: 0 };
 
 /* =========================
    Helpers
@@ -38,250 +48,120 @@ let cache = { cookieHeader: '', cookies: [], authHeader: '', expires: 0 };
 function requireKey(req, res, next) {
   if (!API_KEY) return next();
   if (req.headers['x-api-key'] === API_KEY) return next();
-  res.status(401).json({ error: 'unauthorized' });
-}
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function exists(p) { try { return fs.existsSync(p); } catch { return false; } }
-
-async function gotoSoft(page, url, waitUntil = WAIT_UNTIL, timeout = NAV_TIMEOUT_MS, tries = 2) {
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    try {
-      await page.goto(url, { waitUntil, timeout });
-      return { ok: true };
-    } catch (e) {
-      lastErr = e;
-      await sleep(350);
-    }
-  }
-  return { ok: false, error: (lastErr && (lastErr.name || String(lastErr))) || 'NAV_FAILED' };
+  return res.status(401).json({ error: 'unauthorized' });
 }
 
-/* =========================
-   Profiles
-========================= */
-function listCandidateProfiles() {
-  const names = ['Default'];
-  for (let i = 1; i <= 8; i++) names.push(`Profile ${i}`);
-  const seen = new Set();
-  return [PROFILE_NAME_PREFERRED, ...names].filter(n => !seen.has(n) && (seen.add(n), true));
-}
-function dirHasCookieDb(p) {
-  return exists(path.join(p, 'Cookies')) ||
-         exists(path.join(p, 'Cookies-wal')) ||
-         exists(path.join(p, 'Network', 'Cookies')) ||
-         exists(path.join(p, 'Network', 'Cookies-wal'));
+function withDeadline(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('deadline')), ms);
+    promise.then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+  });
 }
 
-/* =========================
-   Auth header
-========================= */
-function buildSAPISIDHASH(cookies, origin = 'https://ads.google.com') {
+async function readSeed() {
+  try { return await fsp.readFile(SEED_FILE, 'utf8'); } catch { return ''; }
+}
+async function writeSeed(v) {
+  await fsp.mkdir(path.dirname(SEED_FILE), { recursive: true });
+  await fsp.writeFile(SEED_FILE, v || '', 'utf8');
+}
+
+function parseCookieHeader(str) {
+  // Turn "a=b; c=d; SID=..." into Playwright cookie objects
+  return (str || '')
+    .split(/;\s*/)
+    .map(kv => {
+      const i = kv.indexOf('=');
+      if (i < 0) return null;
+      const name = kv.slice(0, i).trim();
+      const value = kv.slice(i + 1).trim();
+      if (!name) return null;
+      return {
+        name,
+        value,
+        domain: '.google.com',
+        path: '/',
+        secure: true,
+        httpOnly: true,
+        sameSite: 'Lax',
+        // give seeded cookies a week, GAIA may overwrite anyway
+        expires: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildSAPISIDHASH(cookies, origin) {
   const get = n => cookies.find(c => c.name === n)?.value;
   const sapsid = get('SAPISID') || get('__Secure-3PAPISID') || get('__Secure-1PAPISID');
   if (!sapsid) return '';
   const ts = Math.floor(Date.now() / 1000);
-  const hash = crypto.createHash('sha1').update(`${ts} ${sapsid} ${origin}`).digest('hex');
+  const hash = crypto
+    .createHash('sha1')
+    .update(`${ts} ${sapsid} ${origin}`)
+    .digest('hex');
   return `SAPISIDHASH ${ts}_${hash}`;
 }
-function hasAuthCookies(list) {
-  return list.some(c => c.name === 'SID' || c.name === '__Secure-1PSID' || c.name === '__Secure-3PSID');
+
+function cookieHeaderFrom(cookies) {
+  return cookies
+    .filter(c => (c.domain || '').includes('google.com'))
+    .map(c => `${c.name}=${c.value}`)
+    .join('; ');
 }
 
 /* =========================
-   CDP cookies (hardened)
+   Cookie fetch (Playwright)
 ========================= */
-async function getAllCookies(page) {
-  const client = await page.target().createCDPSession();
-  try { await client.send('Network.enable'); } catch {}
-  let cookies = [];
-  try {
-    const r = await client.send('Network.getAllCookies');
-    cookies = r?.cookies || [];
-  } catch {}
-  if (!cookies.length) {
-    try {
-      const r2 = await client.send('Storage.getCookies'); // fallback
-      cookies = r2?.cookies || [];
-    } catch {}
-  }
-  return cookies;
-}
-async function waitForSID(page, timeoutMs = 12000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const ck = await getAllCookies(page);
-    if (hasAuthCookies(ck)) return ck;
-    await sleep(500);
-  }
-  return await getAllCookies(page);
-}
-
-/* =========================
-   Clone profile
-========================= */
-async function copyCookieStores(srcDir, dstDir) {
-  try {
-    const entries = await fsp.readdir(srcDir, { withFileTypes: true });
-    await fsp.mkdir(dstDir, { recursive: true });
-    const names = new Set(entries.map(e => e.name));
-    for (const base of ['Cookies']) {
-      for (const suf of ['', '-wal', '-shm']) {
-        const name = `${base}${suf}`;
-        if (!names.has(name)) continue;
-        await fsp.copyFile(path.join(srcDir, name), path.join(dstDir, name));
-      }
-    }
-  } catch {}
-}
-async function rmrf(p) { await fsp.rm(p, { recursive: true, force: true }); }
-
-async function cloneNamedProfileToTemp(profileName) {
-  const profilePath = path.join(PROFILE_DIR, profileName);
-  const dstRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'lsa-prof-'));
-  const dstProfile = path.join(dstRoot, profileName);
-
-  try { await fsp.copyFile(path.join(PROFILE_DIR, 'Local State'), path.join(dstRoot, 'Local State')); } catch {}
-  await fsp.mkdir(dstProfile, { recursive: true });
-
-  if (exists(profilePath)) {
-    await copyCookieStores(profilePath, dstProfile);
-    await copyCookieStores(path.join(profilePath, 'Network'), path.join(dstProfile, 'Network'));
-    for (const extra of ['Preferences', 'Secure Preferences', 'Login Data']) {
-      try { await fsp.copyFile(path.join(profilePath, extra), path.join(dstProfile, extra)); } catch {}
-    }
+async function getCookiesAndHeader(targetUrl, { force=false, useSeed=true, clear=false } = {}) {
+  if (!force && cache.header && Date.now() < cache.expires) {
+    return { header: cache.header, cookies: cache.cookies, fromCache: true };
   }
 
-  return {
-    userDataDir: dstRoot,
-    profileName,
-    source: {
-      root: profilePath,
-      hasCookies: exists(path.join(profilePath, 'Cookies')),
-      hasCookiesWal: exists(path.join(profilePath, 'Cookies-wal')),
-      hasNetCookies: exists(path.join(profilePath, 'Network', 'Cookies')),
-      hasNetCookiesWal: exists(path.join(profilePath, 'Network', 'Cookies-wal')),
-    },
-    cleanup: async () => { try { await rmrf(dstRoot); } catch {} }
-  };
-}
-
-/* =========================
-   Try one profile
-========================= */
-async function tryProfileOnce(profileName, targetUrl) {
-  const cloned = await cloneNamedProfileToTemp(profileName);
-
-  const browser = await puppeteer.launch({
+  // Playwright persistent context: points to the *user data dir root*
+  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: HEADLESS,
-    executablePath: CHROME_PATH,
-    userDataDir: cloned.userDataDir,
     args: [
-      `--profile-directory=${profileName}`,
       '--no-sandbox',
       '--disable-dev-shm-usage',
+      `--profile-directory=${PROFILE_NAME}`,
       '--password-store=basic',
       '--use-mock-keychain',
       '--no-first-run',
-      '--no-default-browser-check'
-    ]
+      '--no-default-browser-check',
+    ],
   });
 
   try {
-    const page = await browser.newPage();
+    if (clear) {
+      try { await ctx.clearCookies(); } catch {}
+    }
+
+    if (useSeed) {
+      const seeded = await readSeed();
+      const toSet = parseCookieHeader(seeded);
+      if (toSet.length) await ctx.addCookies(toSet);
+    }
+
+    const page = await ctx.newPage();
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
 
-    // GAIA preflight
-    await gotoSoft(
-      page,
-      'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/'
-    );
+    // Navigate to the target URL (accountpicker is best to mint auth cookies)
+    const url = targetUrl || TARGET_URL;
+    await withDeadline(
+      page.goto(url, { waitUntil: WAIT_UNTIL, timeout: NAV_TIMEOUT_MS }),
+      NAV_TIMEOUT_MS + 5000
+    ).catch(() => { /* swallow; we will still collect cookies */ });
 
-    const base = targetUrl || LSA_URL;
-    const touchUrls = [
-      base,
-      'https://ads.google.com/localservicesads/leads',
-      'https://ads.google.com/localservicesads/accountpicker',
-      // deep “lead” URL (strong minting touch)
-      'https://ads.google.com/localservices/lead?cid=1711176863&bid=2543314145&pid=9999999999&mcid=9121518467&euid=5170738981&lid=4823432947&hl=en&gl=US'
-    ];
+    // Collect cookies from the whole context (not just the page)
+    const cookies = await ctx.cookies();
+    const header = cookieHeaderFrom(cookies);
 
-    let cookies = [];
-    for (const u of touchUrls) {
-      const bust = u + (u.includes('?') ? '&' : '?') + `t=${Date.now()}`;
-      await gotoSoft(page, bust);
-      await sleep(800);
-      cookies = await waitForSID(page, 6000);
-      if (hasAuthCookies(cookies)) break;
-    }
-
-    // One more GAIA poke if needed
-    if (!hasAuthCookies(cookies)) {
-      await gotoSoft(
-        page,
-        'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/'
-      );
-      await sleep(600);
-      const bust = base + (base.includes('?') ? '&' : '?') + `t=${Date.now()}`;
-      await gotoSoft(page, bust);
-      await sleep(800);
-      cookies = await waitForSID(page, 8000);
-    }
-
-    const foundAuth = cookies
-      .filter(c => ['SID','__Secure-1PSID','__Secure-3PSID','SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'].includes(c.name))
-      .map(c => c.name);
-
-    const cookieHeader = cookies
-      .filter(c => (c.domain || '').includes('google.com'))
-      .map(c => `${c.name}=${c.value}`)
-      .join('; ');
-
-    const origin = new URL(base).origin;
-    const authHeader = buildSAPISIDHASH(cookies, origin);
-
-    return {
-      ok: Boolean(foundAuth.length || authHeader),
-      cookies,
-      cookieHeader,
-      authHeader,
-      origin,
-      foundAuth,
-      sampleCookieNames: cookies.slice(0, 24).map(c => c.name),
-      debug: { pickedProfile: profileName, source: cloned.source },
-      _cleanup: cloned.cleanup
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      error: e.message,
-      debug: { pickedProfile: profileName, source: cloned.source },
-      _cleanup: cloned.cleanup
-    };
+    cache = { header, cookies, expires: Date.now() + COOKIE_TTL_MS };
+    return { header, cookies, fromCache: false };
   } finally {
-    await browser.close();
+    await ctx.close().catch(() => {});
   }
-}
-
-/* =========================
-   Multi-profile loop
-========================= */
-async function fetchFreshAuth(targetUrl, forcedProfile) {
-  const candidates = forcedProfile ? [forcedProfile] : listCandidateProfiles();
-  for (const candidate of candidates) {
-    const attempt = await tryProfileOnce(candidate, targetUrl);
-    try { await attempt._cleanup(); } catch {}
-    if (attempt.ok) return attempt;
-  }
-  return {
-    cookies: [],
-    cookieHeader: '',
-    authHeader: '',
-    origin: new URL(targetUrl || LSA_URL).origin,
-    foundAuth: [],
-    sampleCookieNames: [],
-    debug: { pickedProfile: candidates[candidates.length - 1] }
-  };
 }
 
 /* =========================
@@ -289,35 +169,62 @@ async function fetchFreshAuth(targetUrl, forcedProfile) {
 ========================= */
 app.get('/cookie', requireKey, async (req, res) => {
   try {
-    const force   = ['1','true','yes'].includes(String(req.query.force || '').toLowerCase());
-    const url     = req.query.url || LSA_URL;
-    const profile = (req.query.profile || '').trim() || undefined;
-    const verbose = ['1','true','yes'].includes(String(req.query.verbose || '').toLowerCase());
+    const force = ['1','true','yes'].includes(String(req.query.force || '').toLowerCase());
+    const useSeed = !(['0','false','no'].includes(String(req.query.seed || '').toLowerCase()));
+    const clear = ['1','true','yes'].includes(String(req.query.clear || '').toLowerCase());
 
-    if (!force && cache.cookieHeader && Date.now() < cache.expires && !profile) {
-      return res.json({
-        cookieHeader: cache.cookieHeader,
-        authHeader:   cache.authHeader,
-        origin:       new URL(url).origin,
-        fromCache:    true,
-        at:           new Date().toISOString()
-      });
-    }
+    const url = req.query.url || TARGET_URL;
+    const origin = req.query.origin || new URL(url).origin || 'https://ads.google.com';
 
-    const result = await fetchFreshAuth(url, profile);
-    cache = {
-      cookieHeader: result.cookieHeader,
-      cookies: result.cookies,
-      authHeader: result.authHeader,
-      expires: Date.now() + COOKIE_TTL_MS
-    };
+    const { header, cookies, fromCache } = await getCookiesAndHeader(url, { force, useSeed, clear });
 
-    res.json({ ...result, fromCache: false, at: new Date().toISOString(), debug: verbose ? result.debug : { pickedProfile: result.debug?.pickedProfile } });
+    // Build auth header and simple login diagnostics
+    const names = new Set(cookies.map(c => c.name));
+    const hasSID = names.has('SID') || names.has('__Secure-1PSID') || names.has('__Secure-3PSID');
+    const hasSAPISID =
+      names.has('SAPISID') || names.has('__Secure-1PAPISID') || names.has('__Secure-3PAPISID');
+    const needLogin = !(hasSID && hasSAPISID);
+
+    const authHeader = buildSAPISIDHASH(cookies, origin);
+
+    res.json({
+      cookieHeader: header,
+      authHeader,
+      origin,
+      hasSID,
+      hasSAPISID,
+      needLogin,
+      forced: force,
+      usedSeed: useSeed,
+      cleared: clear,
+      fromCache,
+      at: new Date().toISOString(),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
 });
 
+app.post('/seed', requireKey, async (req, res) => {
+  try {
+    const { cookieHeader } = req.body || {};
+    if (!cookieHeader || typeof cookieHeader !== 'string') {
+      return res.status(400).json({ error: 'cookieHeader string required' });
+    }
+    await writeSeed(cookieHeader);
+    cache = { header: '', cookies: [], expires: 0 };
+    res.json({ ok: true, bytes: cookieHeader.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+app.delete('/seed', requireKey, async (_req, res) => {
+  await writeSeed('');
+  cache = { header: '', cookies: [], expires: 0 };
+  res.json({ ok: true });
+});
+
 app.get('/healthz', (_req, res) => res.send('ok'));
 
-app.listen(PORT, () => console.log(`lsa-cookie listening on :${PORT}`));
+app.listen(PORT, () => console.log(`lsa-cookie on :${PORT}`));
