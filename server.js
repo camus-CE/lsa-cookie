@@ -23,7 +23,7 @@ async function getCookieHeader() {
   });
 
   const page = await ctx.newPage();
-  await page.goto('https://ads.google.com/localservicesads/leads', { waitUntil: WAIT_UNTIL });
+  await page.goto('https://business.google.com/us/ad-solutions/local-service-ads/', { waitUntil: WAIT_UNTIL });
   const cookies = await ctx.cookies();
   await ctx.close();
 
@@ -49,3 +49,4 @@ app.get('/cookie', async (_req, res) => {
 app.get('/healthz', (_req, res) => res.send('ok'));
 
 app.listen(PORT, () => console.log(`lsa-cookie on :${PORT}`));
+
