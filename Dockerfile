@@ -1,14 +1,13 @@
-FROM mcr.microsoft.com/playwright:v1.55.1-jammy
+# Playwright runtime with Chromium already installed
+FROM mcr.microsoft.com/playwright:v1.47.2-jammy
 
 WORKDIR /app
-
-# install deps first for better caching
 COPY package*.json ./
-RUN npm ci --omit=dev || npm install --omit=dev
+RUN npm ci --omit=dev
 
-# app code
+# your server
 COPY server.js ./
 
-ENV PORT=8080
+# health
 EXPOSE 8080
-CMD ["npm", "start"]
+CMD ["node","server.js"]
