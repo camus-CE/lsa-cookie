@@ -15,8 +15,7 @@ app.use(express.json({ limit: '128kb' }));
 ========================= */
 const PORT        = parseInt(process.env.PORT || '8080', 10);
 const PROFILE_DIR = process.env.PROFILE_DIR || '/config/.config/chromium';
-// preferred name; we will auto-detect if another profile actually holds cookies
-const PROFILE_NAME_PREFERRED = process.env.PROFILE_NAME || 'Default';
+const PROFILE_NAME_PREFERRED = process.env.PROFILE_NAME || 'Default'; // we'll auto-detect anyway
 const HEADLESS    = String(process.env.HEADLESS ?? 'true').toLowerCase() !== 'false';
 const API_KEY     = process.env.API_KEY || '';
 const CHROME_PATH = process.env.CHROMIUM_PATH || '/usr/lib/chromium/chromium';
@@ -26,14 +25,14 @@ const WAIT_UNTIL = ['load','domcontentloaded','networkidle0','networkidle2']
   ? String(process.env.WAIT_UNTIL || 'networkidle0').toLowerCase()
   : 'networkidle0';
 
-// IMPORTANT: LSA tokens are minted under /localservicesads/
-const LSA_URL     = process.env.TARGET_URL || 'https://ads.google.com/localservices/accountpicker';
-const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '600000', 10); // 10m
+// LSA tokens are minted under /localservicesads/
+const LSA_URL     = process.env.TARGET_URL || 'https://ads.google.com/localservicesads/';
+const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '600000', 10); // 10m cache
 
 let cache = { cookieHeader: '', cookies: [], authHeader: '', expires: 0 };
 
 /* =========================
-   Small helpers
+   Helpers
 ========================= */
 function requireKey(req, res, next) {
   if (!API_KEY) return next();
@@ -44,13 +43,12 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function exists(p) { try { return fs.existsSync(p); } catch { return false; } }
 
 /* =========================
-   Profile resolution
+   Profile candidates
 ========================= */
 function listCandidateProfiles() {
   const names = ['Default'];
-  for (let i = 1; i <= 6; i++) names.push(`Profile ${i}`);
+  for (let i = 1; i <= 8; i++) names.push(`Profile ${i}`);
   const seen = new Set();
-  // put preferred first, then common names
   return [PROFILE_NAME_PREFERRED, ...names].filter(n => !seen.has(n) && (seen.add(n), true));
 }
 function dirHasCookieDb(p) {
@@ -58,13 +56,6 @@ function dirHasCookieDb(p) {
          exists(path.join(p, 'Cookies-wal')) ||
          exists(path.join(p, 'Network', 'Cookies')) ||
          exists(path.join(p, 'Network', 'Cookies-wal'));
-}
-function resolveProfileRoot() {
-  for (const name of listCandidateProfiles()) {
-    const full = path.join(PROFILE_DIR, name);
-    if (dirHasCookieDb(full)) return { profileName: name, profilePath: full };
-  }
-  return { profileName: PROFILE_NAME_PREFERRED, profilePath: path.join(PROFILE_DIR, PROFILE_NAME_PREFERRED) };
 }
 
 /* =========================
@@ -83,7 +74,7 @@ function hasAuthCookies(list) {
 }
 
 /* =========================
-   CDP cookie utils
+   CDP cookies + wait
 ========================= */
 async function getAllCookies(page) {
   const client = await page.target().createCDPSession();
@@ -97,11 +88,11 @@ async function waitForSID(page, timeoutMs = 12000) {
     if (hasAuthCookies(ck)) return ck;
     await sleep(500);
   }
-  return await getAllCookies(page);
+  return await getAllCookies(page); // best-effort
 }
 
 /* =========================
-   Clone profile (copy Cookies + WAL/SHM)
+   Clone profile (Cookies + WAL/SHM)
 ========================= */
 async function copyCookieStores(srcDir, dstDir) {
   try {
@@ -117,34 +108,22 @@ async function copyCookieStores(srcDir, dstDir) {
     }
   } catch {}
 }
-async function copyDir(src, dst) {
-  await fsp.mkdir(dst, { recursive: true });
-  const entries = await fsp.readdir(src, { withFileTypes: true });
-  await Promise.all(entries.map(async ent => {
-    const s = path.join(src, ent.name);
-    const d = path.join(dst, ent.name);
-    if (ent.isDirectory()) return copyDir(s, d);
-    if (ent.isFile()) {
-      await fsp.mkdir(path.dirname(d), { recursive: true });
-      return fsp.copyFile(s, d);
-    }
-  }));
-}
 async function rmrf(p) { await fsp.rm(p, { recursive: true, force: true }); }
 
-async function cloneProfileToTemp() {
-  const { profileName, profilePath } = resolveProfileRoot();
+async function cloneNamedProfileToTemp(profileName) {
+  const profilePath = path.join(PROFILE_DIR, profileName);
   const dstRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'lsa-prof-'));
   const dstProfile = path.join(dstRoot, profileName);
 
-  // Local State (os_crypt key for cookie decryption)
+  // Local State carries the os_crypt key
   try { await fsp.copyFile(path.join(PROFILE_DIR, 'Local State'), path.join(dstRoot, 'Local State')); } catch {}
-
   await fsp.mkdir(dstProfile, { recursive: true });
 
   // Copy cookie DBs from both locations
-  await copyCookieStores(profilePath, dstProfile);
-  await copyCookieStores(path.join(profilePath, 'Network'), path.join(dstProfile, 'Network'));
+  if (exists(profilePath)) {
+    await copyCookieStores(profilePath, dstProfile);
+    await copyCookieStores(path.join(profilePath, 'Network'), path.join(dstProfile, 'Network'));
+  }
 
   // Best-effort extras
   for (const extra of ['Preferences', 'Login Data', 'Secure Preferences']) {
@@ -154,82 +133,97 @@ async function cloneProfileToTemp() {
   return {
     userDataDir: dstRoot,
     profileName,
-    debug: {
-      pickedProfile: profileName,
-      source: {
-        root: profilePath,
-        hasCookies: exists(path.join(profilePath, 'Cookies')),
-        hasCookiesWal: exists(path.join(profilePath, 'Cookies-wal')),
-        hasNetCookies: exists(path.join(profilePath, 'Network', 'Cookies')),
-        hasNetCookiesWal: exists(path.join(profilePath, 'Network', 'Cookies-wal')),
-      }
+    source: {
+      root: profilePath,
+      hasCookies: exists(path.join(profilePath, 'Cookies')),
+      hasCookiesWal: exists(path.join(profilePath, 'Cookies-wal')),
+      hasNetCookies: exists(path.join(profilePath, 'Network', 'Cookies')),
+      hasNetCookiesWal: exists(path.join(profilePath, 'Network', 'Cookies-wal')),
     },
     cleanup: async () => { try { await rmrf(dstRoot); } catch {} }
   };
 }
 
 /* =========================
-   Main auth fetch
+   Try multiple profiles until auth is found
 ========================= */
 async function fetchFreshAuth(targetUrl) {
-  const cloned = await cloneProfileToTemp();
+  const candidates = listCandidateProfiles();
+  let lastDebug = {};
 
-  const browser = await puppeteer.launch({
-    headless: HEADLESS,
-    executablePath: CHROME_PATH,
-    userDataDir: cloned.userDataDir,
-    args: [
-      `--profile-directory=${cloned.profileName}`,
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--password-store=basic',
-      '--use-mock-keychain',
-      '--no-first-run',
-      '--no-default-browser-check'
-    ]
-  });
+  for (const candidate of candidates) {
+    const cloned = await cloneNamedProfileToTemp(candidate);
+    lastDebug = { pickedProfile: candidate, source: cloned.source };
 
-  try {
-    const page = await browser.newPage();
+    const browser = await puppeteer.launch({
+      headless: HEADLESS,
+      executablePath: CHROME_PATH,
+      userDataDir: cloned.userDataDir,
+      args: [
+        `--profile-directory=${candidate}`,
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--password-store=basic',
+        '--use-mock-keychain',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    });
 
-    // GAIA preflight
-    const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservices/accountpicker';
-    await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
-    await sleep(800);
+    try {
+      const page = await browser.newPage();
 
-    // Hit LSA (tokens minted here)
-    const url = (targetUrl || LSA_URL) + ((targetUrl || LSA_URL).includes('?') ? '&' : '?') + `t=${Date.now()}`;
-    await page.goto(url, { waitUntil: WAIT_UNTIL });
-    await sleep(1200);
-
-    // Wait until SID/PSID are present
-    let cookies = await waitForSID(page);
-
-    // If still missing, poke GAIA once more
-    if (!hasAuthCookies(cookies)) {
-      const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservices/accountpicker';
-      await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
+      // GAIA preflight (through the LSA flow)
+      const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/';
+      await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
       await sleep(800);
-      cookies = await waitForSID(page, 8000);
+
+      // LSA page (mints PSIDTS/SIDTS)
+      const url = (targetUrl || LSA_URL) + ((targetUrl || LSA_URL).includes('?') ? '&' : '?') + `t=${Date.now()}`;
+      await page.goto(url, { waitUntil: WAIT_UNTIL });
+      await sleep(1200);
+
+      // Wait for GAIA session cookies
+      let cookies = await waitForSID(page);
+
+      if (!hasAuthCookies(cookies)) {
+        const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/';
+        await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
+        await sleep(800);
+        cookies = await waitForSID(page, 8000);
+      }
+
+      const foundAuth = cookies
+        .filter(c => ['SID','__Secure-1PSID','__Secure-3PSID','SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'].includes(c.name))
+        .map(c => c.name);
+
+      const cookieHeader = cookies
+        .filter(c => (c.domain || '').includes('google.com'))
+        .map(c => `${c.name}=${c.value}`)
+        .join('; ');
+
+      const origin = new URL(targetUrl || LSA_URL).origin;
+      const authHeader = buildSAPISIDHASH(cookies, origin);
+
+      if (foundAuth.length || authHeader) {
+        return { cookies, cookieHeader, authHeader, origin, foundAuth, debug: lastDebug };
+      }
+      // else try next candidate
+    } finally {
+      await browser.close();
+      await cloned.cleanup();
     }
-
-    const cookieHeader = cookies
-      .filter(c => (c.domain || '').includes('google.com'))
-      .map(c => `${c.name}=${c.value}`)
-      .join('; ');
-
-    const origin = new URL(targetUrl || LSA_URL).origin;
-    const authHeader = buildSAPISIDHASH(cookies, origin);
-
-    const foundAuth = cookies
-      .filter(c => ['SID','__Secure-1PSID','__Secure-3PSID','SAPISID','__Secure-1PAPISID','__Secure-3PAPISID'].includes(c.name))
-      .map(c => c.name);
-
-    return { cookies, cookieHeader, authHeader, origin, foundAuth, debug: cloned.debug };
-  } finally {
-    await browser.close();
-    await cloned.cleanup();
   }
+
+  // none worked — return debug so you can see what it tried
+  return {
+    cookies: [],
+    cookieHeader: '',
+    authHeader: '',
+    origin: new URL(LSA_URL).origin,
+    foundAuth: [],
+    debug: lastDebug
+  };
 }
 
 /* =========================
@@ -260,16 +254,22 @@ app.get('/cookie', requireKey, async (req, res) => {
 });
 
 app.get('/whoami', (_req, res) => {
-  const { profileName, profilePath } = resolveProfileRoot();
+  // report which profile on disk appears to have cookie DBs
+  let resolvedProfile = PROFILE_NAME_PREFERRED;
+  let resolvedPath = path.join(PROFILE_DIR, PROFILE_NAME_PREFERRED);
+  for (const name of listCandidateProfiles()) {
+    const full = path.join(PROFILE_DIR, name);
+    if (dirHasCookieDb(full)) { resolvedProfile = name; resolvedPath = full; break; }
+  }
   res.json({
     PROFILE_DIR,
     PROFILE_NAME_PREFERRED,
-    resolvedProfile: profileName,
-    resolvedPath: profilePath,
+    resolvedProfile,
+    resolvedPath,
     CHROME_PATH,
     WAIT_UNTIL,
     HEADLESS,
-    hasCookiesDb: dirHasCookieDb(profilePath),
+    hasCookiesDb: dirHasCookieDb(resolvedPath),
   });
 });
 
