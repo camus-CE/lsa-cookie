@@ -1,18 +1,8 @@
-const crypto = require('crypto');
-function buildSAPISIDHASH(cookies, origin) {
-  const sapsid =
-    cookies.find(c => c.name === 'SAPISID')?.value ||
-    cookies.find(c => c.name === '__Secure-3PAPISID')?.value ||
-    cookies.find(c => c.name === '__Secure-1PAPISID')?.value;
-  if (!sapsid) return '';
-  const ts = Math.floor(Date.now()/1000);
-  const hash = crypto.createHash('sha1').update(`${ts} ${sapsid} ${origin}`).digest('hex');
-  return `SAPISIDHASH ${ts}_${hash}`;
-}
 const express = require('express');
 const { chromium } = require('playwright');
 const fs = require('fs/promises');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '256kb' }));
@@ -22,11 +12,11 @@ const PROFILE_DIR = process.env.PROFILE_DIR || '/config/profile';
 const PROFILE_NAME = process.env.PROFILE_NAME || 'Default';
 const WAIT_UNTIL = process.env.WAIT_UNTIL || 'domcontentloaded';
 const TARGET_URL = process.env.TARGET_URL || 'https://ads.google.com/localservices/accountpicker';
-const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '3600000', 10); // 1h cache
-const API_KEY = process.env.API_KEY || ''; // set this in Sliplane for protection
+const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '3600000', 10);
+const API_KEY = process.env.API_KEY || '';
 const SEED_FILE = process.env.SEED_FILE || '/config/seed-cookie.txt';
 
-let cache = { header: '', expires: 0 };
+let cache = { header: '', cookies: [], expires: 0 };
 
 function requireKey(req, res, next) {
   if (!API_KEY) return next();
@@ -34,69 +24,50 @@ function requireKey(req, res, next) {
   return res.status(401).json({ error: 'unauthorized' });
 }
 
-async function readSeed() {
-  try { return await fs.readFile(SEED_FILE, 'utf8'); } catch { return ''; }
-}
+async function readSeed() { try { return await fs.readFile(SEED_FILE, 'utf8'); } catch { return ''; } }
 async function writeSeed(v) {
   await fs.mkdir(path.dirname(SEED_FILE), { recursive: true });
   await fs.writeFile(SEED_FILE, v || '', 'utf8');
 }
 
 function parseCookieHeader(str) {
-  // Convert "a=b; c=d; SID=..." into Playwright cookie objects
-  const now = Math.floor(Date.now() / 1000);
-  const exp = now + 7 * 24 * 3600;
-
-  return (str || '')
-    .split(/;\s*/)
-    .map(kv => {
-      const i = kv.indexOf('=');
-      if (i < 0) return null;
-      const name = kv.slice(0, i).trim();
-      const value = kv.slice(i + 1).trim();
-      if (!name) return null;
-
-      // Base cookie fields
-      const base = {
-        name,
-        value,
-        path: '/',
-        secure: true,
-        httpOnly: true,
-        sameSite: 'Lax',
-        expires: exp,
-      };
-
-      // 1) __Host-* must be host-only (no Domain) → use url
-      if (name.startsWith('__Host-')) {
-        return { ...base, url: 'https://ads.google.com' };
-      }
-
-      // 2) OSID cookies live on accounts.google.com
-      if (name === 'OSID' || name === '__Secure-OSID') {
-        return { ...base, domain: 'accounts.google.com' };
-      }
-
-      // 3) Everything else: .google.com (covers SID/HSID/SSID/APISID/SAPISID/NID/etc.)
-      return { ...base, domain: '.google.com' };
-    })
-    .filter(Boolean);
+  return (str || '').split(/;\s*/).map(kv => {
+    const i = kv.indexOf('='); if (i < 0) return null;
+    const name = kv.slice(0, i).trim(); const value = kv.slice(i + 1).trim();
+    if (!name) return null;
+    return {
+      name, value, domain: '.google.com', path: '/',
+      secure: true, httpOnly: true, sameSite: 'Lax',
+      expires: Math.floor(Date.now() / 1000) + 7 * 24 * 3600,
+    };
+  }).filter(Boolean);
 }
 
-// change signature to accept { force }
-async function getCookiesAndHeader(targetUrl, { force = false } = {}) {
+function buildSAPISIDHASH(cookies, origin) {
+  const c = n => cookies.find(x => x.name === n)?.value;
+  const sapsid = c('SAPISID') || c('__Secure-3PAPISID') || c('__Secure-1PAPISID');
+  if (!sapsid) return '';
+  const ts = Math.floor(Date.now() / 1000);
+  const hash = crypto.createHash('sha1').update(`${ts} ${sapsid} ${origin}`).digest('hex');
+  return `SAPISIDHASH ${ts}_${hash}`;
+}
+
+async function getCookiesAndHeader(targetUrl, { force=false, useSeed=true, clear=false } = {}) {
   if (!force && cache.header && Date.now() < cache.expires) {
-    return { header: cache.header, cookies: cache.cookies || [] };
+    return { header: cache.header, cookies: cache.cookies, fromCache: true };
   }
-  if (force) cache = { header: '', cookies: [], expires: 0 }; // bust in-memory cache
 
   const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage', `--profile-directory=${PROFILE_NAME}`],
   });
 
-  const seeded = await readSeed();
-  if (seeded) {
+  if (clear) {
+    try { await ctx.clearCookies(); } catch {}
+  }
+
+  if (useSeed) {
+    const seeded = await readSeed();
     const toSet = parseCookieHeader(seeded);
     if (toSet.length) await ctx.addCookies(toSet);
   }
@@ -107,41 +78,44 @@ async function getCookiesAndHeader(targetUrl, { force = false } = {}) {
   const cookies = await ctx.cookies();
   await ctx.close();
 
-  const header = cookies.filter(c => (c.domain || '').includes('google.com'))
-                        .map(c => `${c.name}=${c.value}`).join('; ');
+  const header = cookies
+    .filter(c => (c.domain || '').includes('google.com'))
+    .map(c => `${c.name}=${c.value}`)
+    .join('; ');
 
   cache = { header, cookies, expires: Date.now() + COOKIE_TTL_MS };
-  return { header, cookies };
+  return { header, cookies, fromCache: false };
 }
 
 app.get('/cookie', requireKey, async (req, res) => {
   try {
-    const url = req.query.url || TARGET_URL;
-    const origin = req.query.origin || new URL(url).origin;
-    const force = ['1','true','yes'].includes(String(req.query.force).toLowerCase());
+    const force = ['1','true','yes'].includes(String(req.query.force || '').toLowerCase());
+    const useSeed = !(['0','false','no'].includes(String(req.query.seed || '').toLowerCase()));
+    const clear = ['1','true','yes'].includes(String(req.query.clear || '').toLowerCase());
 
-    const { header, cookies } = await getCookiesAndHeader(url, { force });
+    const url = req.query.url || TARGET_URL;
+    const origin = req.query.origin || new URL(url).origin || 'https://ads.google.com';
+
+    const { header, cookies, fromCache } =
+      await getCookiesAndHeader(url, { force, useSeed, clear });
+
     const authHeader = buildSAPISIDHASH(cookies, origin);
 
-    res.json({ cookieHeader: header, authHeader, origin, forced: force });
+    res.json({
+      cookieHeader: header,
+      authHeader,
+      origin,
+      forced: force,
+      usedSeed: useSeed,
+      cleared: clear,
+      fromCache,
+      at: new Date().toISOString(),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
 });
 
-app.get('/cookie', requireKey, async (req, res) => {
-  try {
-    const url = req.query.url || TARGET_URL;
-    const origin = req.query.origin || 'https://ads.google.com';
-    const { header, cookies } = await getCookiesAndHeader(url);
-    const authHeader = buildSAPISIDHASH(cookies, origin);
-    res.json({ cookieHeader: header, authHeader });
-  } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
-  }
-});
-
-// Seed / replace the cookie header the service will use.
 app.post('/seed', requireKey, async (req, res) => {
   try {
     const { cookieHeader } = req.body || {};
@@ -149,23 +123,18 @@ app.post('/seed', requireKey, async (req, res) => {
       return res.status(400).json({ error: 'cookieHeader string required' });
     }
     await writeSeed(cookieHeader);
-    cache = { header: '', expires: 0 }; // bust cache
+    cache = { header: '', cookies: [], expires: 0 };
     res.json({ ok: true, bytes: cookieHeader.length });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
 });
 
-// Clear seed
 app.delete('/seed', requireKey, async (_req, res) => {
   await writeSeed('');
-  cache = { header: '', expires: 0 };
+  cache = { header: '', cookies: [], expires: 0 };
   res.json({ ok: true });
 });
 
-// health
 app.get('/healthz', (_req, res) => res.send('ok'));
-
 app.listen(PORT, () => console.log(`lsa-cookie on :${PORT}`));
-
-
