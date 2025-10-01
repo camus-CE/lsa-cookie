@@ -51,46 +51,33 @@ function buildSAPISIDHASH(cookies, origin = 'https://ads.google.com') {
   return `SAPISIDHASH ${ts}_${hash}`;
 }
 
-// ---- clone profile to avoid ProcessSingleton lock ----
-async function cloneProfileToTemp() {
-  const srcRoot = PROFILE_DIR;
-  const srcDefault = path.join(srcRoot, PROFILE_NAME);
-  const dstRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'lsa-prof-'));
-  const dstDefault = path.join(dstRoot, PROFILE_NAME);
+// ===== profile clone to avoid ProcessSingleton lock =====
 
-  // copy Local State (has os_crypt key)
-  try { await fsp.copyFile(path.join(srcRoot, 'Local State'), path.join(dstRoot, 'Local State')); } catch {}
-
-  // minimal files from Default needed to read cookies
-  const mustCopy = [
-    'Cookies',
-    path.join('Network', 'Cookies'),
-    'Preferences',
-    'Login Data',
-    'Secure Preferences'
-  ];
-
-  await fsp.mkdir(dstDefault, { recursive: true });
-  for (const entry of mustCopy) {
-    const src = path.join(srcDefault, entry);
-    const dst = path.join(dstDefault, entry);
-    try {
-      const stat = await fsp.stat(src);
-      if (stat.isDirectory()) await copyDir(src, dst);
-      else {
-        await fsp.mkdir(path.dirname(dst), { recursive: true });
-        await fsp.copyFile(src, dst);
+// Copy Cookies + WAL/SHM from a source dir into a dest dir
+async function copyCookieStores(srcDir, dstDir) {
+  try {
+    const entries = await fsp.readdir(srcDir, { withFileTypes: true });
+    await fsp.mkdir(dstDir, { recursive: true });
+    const names = new Set(entries.map(e => e.name));
+    for (const base of ['Cookies']) {
+      for (const suf of ['', '-wal', '-shm']) {
+        const name = `${base}${suf}`;
+        if (!names.has(name)) continue;
+        const s = path.join(srcDir, name);
+        const d = path.join(dstDir, name);
+        await fsp.mkdir(path.dirname(d), { recursive: true });
+        await fsp.copyFile(s, d);
       }
-    } catch {}
+    }
+  } catch {
+    // best-effort copy; some dirs may not exist
   }
-
-  return { userDataDir: dstRoot, cleanup: async () => { try { await rmrf(dstRoot); } catch {} } };
 }
 
 async function copyDir(src, dst) {
   await fsp.mkdir(dst, { recursive: true });
   const entries = await fsp.readdir(src, { withFileTypes: true });
-  await Promise.all(entries.map(async (ent) => {
+  await Promise.all(entries.map(async ent => {
     const s = path.join(src, ent.name);
     const d = path.join(dst, ent.name);
     if (ent.isDirectory()) return copyDir(s, d);
@@ -103,14 +90,43 @@ async function copyDir(src, dst) {
 
 async function rmrf(p) { await fsp.rm(p, { recursive: true, force: true }); }
 
-// Pull ALL cookies via CDP (works across domains & Puppeteer versions)
+async function cloneProfileToTemp() {
+  const srcRoot = PROFILE_DIR;
+  const srcDefault = path.join(srcRoot, PROFILE_NAME);
+  const dstRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'lsa-prof-'));
+  const dstDefault = path.join(dstRoot, PROFILE_NAME);
+
+  // 1) Local State (contains os_crypt key)
+  try {
+    await fsp.copyFile(path.join(srcRoot, 'Local State'), path.join(dstRoot, 'Local State'));
+  } catch {}
+
+  await fsp.mkdir(dstDefault, { recursive: true });
+
+  // 2) Copy cookie DBs (main + WAL/SHM) from both locations
+  await copyCookieStores(srcDefault, dstDefault); // Default/Cookies*
+  await copyCookieStores(path.join(srcDefault, 'Network'), path.join(dstDefault, 'Network')); // Default/Network/Cookies*
+
+  // 3) Copy helpful extras (best-effort)
+  for (const extra of ['Preferences', 'Login Data', 'Secure Preferences']) {
+    try {
+      const s = path.join(srcDefault, extra);
+      const d = path.join(dstDefault, extra);
+      await fsp.mkdir(path.dirname(d), { recursive: true });
+      await fsp.copyFile(s, d);
+    } catch {}
+  }
+
+  return { userDataDir: dstRoot, cleanup: async () => { try { await rmrf(dstRoot); } catch {} } };
+}
+
+// ===== CDP cookies & wait-for-auth =====
 async function getAllCookies(page) {
   const client = await page.target().createCDPSession();
   const { cookies } = await client.send('Network.getAllCookies');
   return cookies || [];
 }
 
-// ---- auth cookie wait logic ----
 function hasAuthCookies(list) {
   return list.some(c => c.name === 'SID' || c.name === '__Secure-1PSID' || c.name === '__Secure-3PSID');
 }
@@ -125,16 +141,16 @@ async function waitForSID(page, timeoutMs = 12000) {
   return await getAllCookies(page); // best effort
 }
 
-// -----------------------------------------------------------
+// ===== main fetch =====
 async function fetchFreshAuth(targetUrl) {
   const { userDataDir, cleanup } = await cloneProfileToTemp();
 
   const browser = await puppeteer.launch({
     headless: HEADLESS,
     executablePath: CHROME_PATH,
-    userDataDir, // launch against the clone
+    userDataDir, // use cloned profile
     args: [
-      `--profile-directory=${PROFILE_NAME}`, // "Default" inside the clone
+      `--profile-directory=${PROFILE_NAME}`, // "Default"
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--password-store=basic',
@@ -147,7 +163,7 @@ async function fetchFreshAuth(targetUrl) {
   try {
     const page = await browser.newPage();
 
-    // GAIA preflight — load account session cookies
+    // GAIA preflight
     const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/';
     await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
     await sleep(800);
@@ -157,10 +173,10 @@ async function fetchFreshAuth(targetUrl) {
     await page.goto(url, { waitUntil: WAIT_UNTIL });
     await sleep(1200);
 
-    // Wait until GAIA session cookies (SID/PSID) are present
+    // Wait until SID/PSID show up
     let cookies = await waitForSID(page);
 
-    // If still missing, poke GAIA once more and wait again
+    // Still missing? Poke GAIA and try again
     if (!hasAuthCookies(cookies)) {
       const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/';
       await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
@@ -183,7 +199,7 @@ async function fetchFreshAuth(targetUrl) {
     return { cookies, cookieHeader, authHeader, origin, foundAuth };
   } finally {
     await browser.close();
-    await cleanup(); // remove temp clone
+    await cleanup();
   }
 }
 
