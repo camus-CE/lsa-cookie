@@ -20,10 +20,14 @@ const HEADLESS    = String(process.env.HEADLESS ?? 'true').toLowerCase() !== 'fa
 const API_KEY     = process.env.API_KEY || '';
 const CHROME_PATH = process.env.CHROMIUM_PATH || '/usr/lib/chromium/chromium';
 
+// Default to 'domcontentloaded' (more robust than networkidle on LSA)
 const WAIT_UNTIL = ['load','domcontentloaded','networkidle0','networkidle2']
-  .includes(String(process.env.WAIT_UNTIL || 'networkidle0').toLowerCase())
-  ? String(process.env.WAIT_UNTIL || 'networkidle0').toLowerCase()
-  : 'networkidle0';
+  .includes(String(process.env.WAIT_UNTIL || 'domcontentloaded').toLowerCase())
+  ? String(process.env.WAIT_UNTIL || 'domcontentloaded').toLowerCase()
+  : 'domcontentloaded';
+
+// Soft navigation timeout (ms) so timeouts don't stall the whole flow
+const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '12000', 10);
 
 // LSA tokens are minted under /localservicesads/
 const LSA_URL     = process.env.TARGET_URL || 'https://ads.google.com/localservicesads/';
@@ -41,6 +45,16 @@ function requireKey(req, res, next) {
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function exists(p) { try { return fs.existsSync(p); } catch { return false; } }
+
+// Soft navigation that never throws; we’ll still poll cookies afterward
+async function gotoSoft(page, url, waitUntil = WAIT_UNTIL, timeout = NAV_TIMEOUT_MS) {
+  try {
+    await page.goto(url, { waitUntil, timeout });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.name || String(e) };
+  }
+}
 
 /* =========================
    Profile candidates
@@ -170,8 +184,8 @@ async function tryProfileOnce(profileName, targetUrl) {
 
     // GAIA preflight through the LSA flow
     const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/';
-    await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
-    await sleep(800);
+    await gotoSoft(page, GAIA_URL, WAIT_UNTIL, NAV_TIMEOUT_MS);
+    await sleep(600);
 
     // build a sequence of "touch" URLs; try caller's URL first
     const base = (targetUrl || LSA_URL);
@@ -179,27 +193,28 @@ async function tryProfileOnce(profileName, targetUrl) {
       base,
       'https://ads.google.com/localservicesads/leads',
       'https://ads.google.com/localservicesads/accountpicker',
-      // your deep lead link (strong minting signal):
+      // deep lead link (strong minting signal):
       'https://ads.google.com/localservices/lead?cid=1711176863&bid=2543314145&pid=9999999999&mcid=9121518467&euid=5170738981&lid=4823432947&hl=en&gl=US',
     ];
 
     let cookies = [];
     for (const u of touchUrls) {
       const urlWithBust = u + (u.includes('?') ? '&' : '?') + `t=${Date.now()}`;
-      await page.goto(urlWithBust, { waitUntil: WAIT_UNTIL });
-      await sleep(1200);
-      cookies = await waitForSID(page, 6000);
+      await gotoSoft(page, urlWithBust, WAIT_UNTIL, NAV_TIMEOUTMS); // typo fixed below
+      await sleep(600);
+      cookies = await waitForSID(page, 5000);
       if (hasAuthCookies(cookies)) break;
     }
 
+    // still nothing? GAIA check + one last base hit
     if (!hasAuthCookies(cookies)) {
       const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/';
-      await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
-      await sleep(800);
+      await gotoSoft(page, GAIA_CHECK, WAIT_UNTIL, NAV_TIMEOUT_MS);
+      await sleep(500);
       const urlWithBust = base + (base.includes('?') ? '&' : '?') + `t=${Date.now()}`;
-      await page.goto(urlWithBust, { waitUntil: WAIT_UNTIL });
-      await sleep(1200);
-      cookies = await waitForSID(page, 8000);
+      await gotoSoft(page, urlWithBust, WAIT_UNTIL, NAV_TIMEOUT_MS);
+      await sleep(600);
+      cookies = await waitForSID(page, 6000);
     }
 
     const foundAuth = cookies
