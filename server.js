@@ -1,3 +1,14 @@
+const crypto = require('crypto');
+function buildSAPISIDHASH(cookies, origin) {
+  const sapsid =
+    cookies.find(c => c.name === 'SAPISID')?.value ||
+    cookies.find(c => c.name === '__Secure-3PAPISID')?.value ||
+    cookies.find(c => c.name === '__Secure-1PAPISID')?.value;
+  if (!sapsid) return '';
+  const ts = Math.floor(Date.now()/1000);
+  const hash = crypto.createHash('sha1').update(`${ts} ${sapsid} ${origin}`).digest('hex');
+  return `SAPISIDHASH ${ts}_${hash}`;
+}
 const express = require('express');
 const { chromium } = require('playwright');
 const fs = require('fs/promises');
@@ -56,15 +67,12 @@ function parseCookieHeader(str) {
     .filter(Boolean);
 }
 
-async function getCookieHeader(targetUrl) {
-  if (cache.header && Date.now() < cache.expires) return cache.header;
+async function getCookiesAndHeader(targetUrl) {
+  if (cache.header && Date.now() < cache.expires) {
+    return { header: cache.header, cookies: cache.cookies || [] };
+  }
+  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, { headless: true, args: ['--no-sandbox','--disable-dev-shm-usage',`--profile-directory=${PROFILE_NAME}`] });
 
-  const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', `--profile-directory=${PROFILE_NAME}`],
-  });
-
-  // If user seeded a cookie, pre-load it before navigation.
   const seeded = await readSeed();
   if (seeded) {
     const toSet = parseCookieHeader(seeded);
@@ -72,26 +80,26 @@ async function getCookieHeader(targetUrl) {
   }
 
   const page = await ctx.newPage();
-  const url = targetUrl || TARGET_URL;
-  await page.goto(url, { waitUntil: WAIT_UNTIL });
+  await page.goto(targetUrl || TARGET_URL, { waitUntil: WAIT_UNTIL });
 
   const cookies = await ctx.cookies();
   await ctx.close();
 
-  const header = cookies
-    .filter(c => (c.domain || '').includes('google.com'))
-    .map(c => `${c.name}=${c.value}`)
-    .join('; ');
+  const header = cookies.filter(c => (c.domain || '').includes('google.com'))
+                        .map(c => `${c.name}=${c.value}`).join('; ');
 
-  cache = { header, expires: Date.now() + COOKIE_TTL_MS };
-  return header;
+  cache = { header, cookies, expires: Date.now() + COOKIE_TTL_MS };
+  return { header, cookies };
 }
+
 
 app.get('/cookie', requireKey, async (req, res) => {
   try {
     const url = req.query.url || TARGET_URL;
-    const cookieHeader = await getCookieHeader(url);
-    res.json({ cookieHeader });
+    const origin = req.query.origin || 'https://ads.google.com';
+    const { header, cookies } = await getCookiesAndHeader(url);
+    const authHeader = buildSAPISIDHASH(cookies, origin);
+    res.json({ cookieHeader: header, authHeader });
   } catch (e) {
     res.status(500).json({ error: e.message || String(e) });
   }
