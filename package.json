@@ -3,11 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "1.55.1"
+    "puppeteer-core": "^22.10.0"
   }
 }
