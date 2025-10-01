@@ -23,7 +23,7 @@ const WAIT_UNTIL = ['load','domcontentloaded','networkidle0','networkidle2']
   ? String(process.env.WAIT_UNTIL||'networkidle0').toLowerCase()
   : 'networkidle0';
 
-const LSA_URL       = process.env.TARGET_URL || 'https://ads.google.com/localservicesads/';
+const LSA_URL       = process.env.TARGET_URL || 'https://ads.google.com/localservices/';
 const COOKIE_TTL_MS = parseInt(process.env.COOKIE_TTL_MS || '600000', 10); // 10m
 
 let cache = { cookieHeader: '', cookies: [], authHeader: '', expires: 0 };
@@ -164,7 +164,7 @@ async function fetchFreshAuth(targetUrl) {
     const page = await browser.newPage();
 
     // GAIA preflight
-    const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservicesads/';
+    const GAIA_URL = 'https://accounts.google.com/ServiceLogin?service=adwords&continue=https://ads.google.com/localservices/';
     await page.goto(GAIA_URL, { waitUntil: WAIT_UNTIL });
     await sleep(800);
 
@@ -178,7 +178,7 @@ async function fetchFreshAuth(targetUrl) {
 
     // Still missing? Poke GAIA and try again
     if (!hasAuthCookies(cookies)) {
-      const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservicesads/';
+      const GAIA_CHECK = 'https://accounts.google.com/CheckCookie?continue=https://ads.google.com/localservices/';
       await page.goto(GAIA_CHECK, { waitUntil: WAIT_UNTIL });
       await sleep(800);
       cookies = await waitForSID(page, 8000);
@@ -243,3 +243,4 @@ app.get('/whoami', (_req, res) => {
 app.get('/healthz', (_req, res) => res.send('ok'));
 
 app.listen(PORT, () => console.log(`lsa-cookie listening on :${PORT}`));
+
