@@ -69,27 +69,32 @@ async function writeSeed(v) {
   await fsp.writeFile(SEED_FILE, v || '', 'utf8');
 }
 
+/** Seed incoming header to ALL relevant Google domains (ads, accounts, .google.com) */
 function parseCookieHeader(str) {
-  return (str || '')
-    .split(/;\s*/)
-    .map(kv => {
-      const i = kv.indexOf('=');
-      if (i < 0) return null;
-      const name = kv.slice(0, i).trim();
-      const value = kv.slice(i + 1).trim();
-      if (!name) return null;
-      return {
-        name,
-        value,
-        domain: '.google.com',
+  const domains = ['ads.google.com', 'accounts.google.com', '.google.com'];
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expSec = nowSec + 7 * 24 * 3600;
+
+  const out = [];
+  (str || '').split(/;\s*/).forEach(kv => {
+    const i = kv.indexOf('=');
+    if (i < 0) return;
+    const name = kv.slice(0, i).trim();
+    const value = kv.slice(i + 1).trim();
+    if (!name) return;
+    for (const d of domains) {
+      out.push({
+        name, value,
+        domain: d,
         path: '/',
         secure: true,
         httpOnly: true,
         sameSite: 'Lax',
-        expires: Math.floor(Date.now() / 1000) + 7 * 24 * 3600, // seed 1 week
-      };
-    })
-    .filter(Boolean);
+        expires: expSec,
+      });
+    }
+  });
+  return out;
 }
 
 function buildSAPISIDHASH(cookies, origin) {
@@ -101,11 +106,21 @@ function buildSAPISIDHASH(cookies, origin) {
   return `SAPISIDHASH ${ts}_${hash}`;
 }
 
+/** Domain-priority merge → ads.google.com > accounts.google.com > .google.com */
 function cookieHeaderFrom(cookies) {
-  return cookies
-    .filter(c => (c.domain || '').includes('google.com'))
-    .map(c => `${c.name}=${c.value}`)
-    .join('; ');
+  const score = d =>
+    /(^|\.)ads\.google\.com$/i.test(d) ? 3 :
+    /(^|\.)accounts\.google\.com$/i.test(d) ? 2 :
+    /google\.com$/i.test(d) ? 1 : 0;
+
+  const best = new Map();
+  for (const c of cookies) {
+    const s = score(c.domain || '');
+    if (s === 0) continue;
+    const prev = best.get(c.name);
+    if (!prev || s > prev._score) best.set(c.name, { ...c, _score: s });
+  }
+  return Array.from(best.values()).map(c => `${c.name}=${c.value}`).join('; ');
 }
 
 async function pathExists(p) {
@@ -206,11 +221,18 @@ async function getCookiesAndHeaderRaw(targetUrl, { useSeed = true, clear = false
     const page = await ctx.newPage();
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
 
+    // 1) Account picker (may bounce via accounts.google.com)
     const url = targetUrl || TARGET_URL;
     await withDeadline(
       page.goto(url, { waitUntil: WAIT_UNTIL, timeout: NAV_TIMEOUT_MS }),
       NAV_TIMEOUT_MS + 5000
-    ).catch(() => { /* swallow; we can still read context cookies */ });
+    ).catch(() => {});
+
+    // 2) Warm Ads UI – reliably mints ADS_* cookies
+    await withDeadline(
+      page.goto('https://ads.google.com/aw/localservices', { waitUntil: WAIT_UNTIL, timeout: NAV_TIMEOUT_MS }),
+      NAV_TIMEOUT_MS + 5000
+    ).catch(() => {});
 
     const cookies = await ctx.cookies();
     const header = cookieHeaderFrom(cookies);
@@ -259,6 +281,10 @@ app.get('/cookie', requireKey, async (req, res) => {
     const hasSAPISID =
       names.has('SAPISID') || names.has('__Secure-1PAPISID') || names.has('__Secure-3PAPISID');
 
+    // Ads-specific health flags
+    const hasAdsSess    = names.has('ADS_CUSTOMER_ACCOUNT_SESSION_INFO');
+    const hasAdsVisitor = names.has('ADS_VISITOR_ID');
+
     const authHeader = buildSAPISIDHASH(cookies, origin);
 
     res.json({
@@ -267,6 +293,9 @@ app.get('/cookie', requireKey, async (req, res) => {
       origin,
       hasSID,
       hasSAPISID,
+      hasAdsSess,
+      hasAdsVisitor,
+      weakForAds: !(hasAdsSess && hasAdsVisitor),
       needLogin: !(hasSID && hasSAPISID),
       forced: force,
       usedSeed: useSeed,
