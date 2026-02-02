@@ -1,6 +1,7 @@
 # Includes Node + Chromium + all required system libraries
 # FROM mcr.microsoft.com/playwright:v1.56.1-jammy
-FROM mcr.microsoft.com/playwright:v1.57.0-jammy
+# FROM mcr.microsoft.com/playwright:v1.57.0-jammy
+FROM mcr.microsoft.com/playwright:v1.58.1-jammy
 
 USER root
 
@@ -35,4 +36,5 @@ ENV COOKIE_TTL_MS=3600000
 
 EXPOSE 8080
 CMD ["node", "server.js"]
+
 
